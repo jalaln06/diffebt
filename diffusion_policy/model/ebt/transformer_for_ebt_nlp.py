@@ -109,7 +109,7 @@ class EBTAttention(nn.Module):
         xq_act, xk_act = apply_rotary_emb(
             xq_act, 
             xk_act, 
-            freqs_cis[1:1+n_action_tokens]  # FIXED: was freqs_cis[1:n_obs_tokens+1]
+            freqs_cis[n_obs_tokens : n_obs_tokens + n_action_tokens]  # FIXED: was freqs_cis[1:n_obs_tokens+1]
         )
         
         # ===== Part 1: Observation Self-Attention =====
