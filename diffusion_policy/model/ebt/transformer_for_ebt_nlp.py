@@ -72,6 +72,40 @@ class EBTAttention(nn.Module):
         for layer in [self.wq, self.wk, self.wv, self.wo]:
             nn.init.normal_(layer.weight, mean=0.0, std=0.02)
 
+class EBTAttention(nn.Module):
+    """
+    Split attention for EBT with dropout support.
+    """
+    def __init__(
+        self, 
+        dim: int, 
+        n_heads: int, 
+        p_drop_attn: float = 0.1, 
+        causal_obs: bool = False,
+        action_attn_type: str = "bidirectional"  # "self", "causal", or "bidirectional"
+    ):
+        super().__init__()
+        assert action_attn_type in ["self", "causal", "bidirectional"], \
+            f"action_attn_type must be 'self', 'causal', or 'bidirectional', got {action_attn_type}"
+        
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.causal_obs = causal_obs
+        self.action_attn_type = action_attn_type
+        
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        
+        # Dropout
+        self.attn_dropout = nn.Dropout(p_drop_attn)
+        self.resid_dropout = nn.Dropout(p_drop_attn)
+        
+        # Initialize
+        for layer in [self.wq, self.wk, self.wv, self.wo]:
+            nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -103,13 +137,10 @@ class EBTAttention(nn.Module):
         
         # Apply RoPE
         xq_obs, xk_obs = apply_rotary_emb(xq_obs, xk_obs, freqs_cis[:n_obs_tokens])
-        
-        # Action tokens use positions [1:1+n_action_tokens] (shifted by 1)
-        # This gives them position indices relative to obs tokens
         xq_act, xk_act = apply_rotary_emb(
             xq_act, 
             xk_act, 
-            freqs_cis[n_obs_tokens : n_obs_tokens + n_action_tokens]  # FIXED: was freqs_cis[1:n_obs_tokens+1]
+            freqs_cis[n_obs_tokens : n_obs_tokens + n_action_tokens]
         )
         
         # ===== Part 1: Observation Self-Attention =====
@@ -127,11 +158,11 @@ class EBTAttention(nn.Module):
             scores_obs = scores_obs + mask_obs
         
         attn_obs = torch.softmax(scores_obs.float(), dim=-1).type_as(xq_obs)
-        attn_obs = self.attn_dropout(attn_obs)  # Apply dropout
+        attn_obs = self.attn_dropout(attn_obs)
         output_obs = torch.matmul(attn_obs, xv_obs)
         output_obs = output_obs.transpose(1, 2).contiguous().view(bsz, n_obs_tokens, -1)
         
-        # ===== Part 2: Action Attention (EBT Style) =====
+        # ===== Part 2: Action Attention =====
         xq_act = xq_act.transpose(1, 2)
         xk_act = xk_act.transpose(1, 2)
         xv_act = xv_act.transpose(1, 2)
@@ -139,39 +170,69 @@ class EBTAttention(nn.Module):
         # Actions attend to ALL observations
         scores_act_to_obs = torch.matmul(xq_act, xk_obs.transpose(2, 3)) / math.sqrt(self.head_dim)
         
-        # Add extra column for self-attention
-        temp_col = torch.zeros(
-            (bsz, self.n_heads, n_action_tokens, 1),
-            dtype=scores_act_to_obs.dtype,
-            device=scores_act_to_obs.device
-        )
-        scores_act = torch.cat([scores_act_to_obs, temp_col], dim=-1)
-        
-        # Compute self-attention scores (superdiagonal)
-        self_attn_scores = (xq_act * xk_act).sum(dim=3) / math.sqrt(self.head_dim)
-        
-        # Insert self-attention on superdiagonal
-        superdiag_rows = torch.arange(n_action_tokens)
-        superdiag_cols = torch.full((n_action_tokens,), n_obs_tokens, dtype=torch.long)
-        
-        diagonal_mask = torch.zeros_like(scores_act)
-        diagonal_mask[:, :, superdiag_rows, superdiag_cols] = self_attn_scores
-        scores_act = scores_act + diagonal_mask
-        
-        # Softmax
-        attn_act = torch.softmax(scores_act.float(), dim=-1).type_as(xq_act)
-        attn_act = self.attn_dropout(attn_act)  # Apply dropout
-        
-        # Extract superdiagonal attention weights
-        attn_act_self = attn_act[:, :, superdiag_rows, superdiag_cols].clone()
-        
-        # Remove self-attention column
-        attn_act_to_obs = attn_act[:, :, :, :-1]
-        
-        # Compute output
-        output_act_from_obs = torch.matmul(attn_act_to_obs, xv_obs)
-        output_act_from_self = xv_act * attn_act_self.unsqueeze(-1)
-        output_act = output_act_from_obs + output_act_from_self
+        if self.action_attn_type == "self":
+            # Original EBT: each action attends only to itself
+            # Add extra column for self-attention
+            temp_col = torch.zeros(
+                (bsz, self.n_heads, n_action_tokens, 1),
+                dtype=scores_act_to_obs.dtype,
+                device=scores_act_to_obs.device
+            )
+            scores_act = torch.cat([scores_act_to_obs, temp_col], dim=-1)
+            
+            # Compute self-attention scores (superdiagonal)
+            self_attn_scores = (xq_act * xk_act).sum(dim=3) / math.sqrt(self.head_dim)
+            
+            # Insert self-attention on superdiagonal
+            superdiag_rows = torch.arange(n_action_tokens, device=x.device)
+            superdiag_cols = torch.full((n_action_tokens,), n_obs_tokens, dtype=torch.long, device=x.device)
+            
+            diagonal_mask = torch.zeros_like(scores_act)
+            diagonal_mask[:, :, superdiag_rows, superdiag_cols] = self_attn_scores
+            scores_act = scores_act + diagonal_mask
+            
+            # Softmax
+            attn_act = torch.softmax(scores_act.float(), dim=-1).type_as(xq_act)
+            attn_act = self.attn_dropout(attn_act)
+            
+            # Extract superdiagonal attention weights
+            attn_act_self = attn_act[:, :, superdiag_rows, superdiag_cols].clone()
+            
+            # Remove self-attention column
+            attn_act_to_obs = attn_act[:, :, :, :-1]
+            
+            # Compute output
+            output_act_from_obs = torch.matmul(attn_act_to_obs, xv_obs)
+            output_act_from_self = xv_act * attn_act_self.unsqueeze(-1)
+            output_act = output_act_from_obs + output_act_from_self
+            
+        elif self.action_attn_type in ["causal", "bidirectional"]:
+            # Actions attend to all actions (full or causal)
+            scores_act_to_act = torch.matmul(xq_act, xk_act.transpose(2, 3)) / math.sqrt(self.head_dim)
+            
+            # Apply causal mask if needed
+            if self.action_attn_type == "causal":
+                mask_act = torch.triu(
+                    torch.ones(n_action_tokens, n_action_tokens, device=x.device),
+                    diagonal=1
+                ) * float('-inf')
+                scores_act_to_act = scores_act_to_act + mask_act
+            
+            # Concatenate: [obs_scores, action_scores]
+            scores_act = torch.cat([scores_act_to_obs, scores_act_to_act], dim=-1)
+            
+            # Softmax over [all obs + all actions]
+            attn_act = torch.softmax(scores_act.float(), dim=-1).type_as(xq_act)
+            attn_act = self.attn_dropout(attn_act)
+            
+            # Split attention weights
+            attn_act_to_obs = attn_act[:, :, :, :n_obs_tokens]
+            attn_act_to_act = attn_act[:, :, :, n_obs_tokens:]
+            
+            # Compute output
+            output_act_from_obs = torch.matmul(attn_act_to_obs, xv_obs)
+            output_act_from_act = torch.matmul(attn_act_to_act, xv_act)
+            output_act = output_act_from_obs + output_act_from_act
         
         output_act = output_act.transpose(1, 2).contiguous().view(bsz, n_action_tokens, -1)
         
@@ -198,9 +259,9 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, hidden_dim: int, p_drop_attn: float, causal_obs: bool):
+    def __init__(self, dim: int, n_heads: int, hidden_dim: int, p_drop_attn: float, causal_obs: bool, action_attn_type: str):
         super().__init__()
-        self.attention = EBTAttention(dim, n_heads, p_drop_attn, causal_obs)
+        self.attention = EBTAttention(dim, n_heads, p_drop_attn, causal_obs, action_attn_type)
         self.feed_forward = FeedForward(dim, hidden_dim, p_drop_attn)
         self.attention_norm = RMSNorm(dim)
         self.ffn_norm = RMSNorm(dim)
@@ -234,6 +295,7 @@ class TransformerForEBT_NLP(ModuleAttrMixin):
         n_cond_layers: int = 0,     # Not used in NLP-style, kept for compatibility
         energy_head_hidden_dim: int = None,
         max_seq_len: int = 512,
+        action_attn_type: str='bidirectional'
     ):
         super().__init__()
         
@@ -256,7 +318,7 @@ class TransformerForEBT_NLP(ModuleAttrMixin):
         # Transformer layers
         hidden_dim = 4 * n_emb
         self.layers = nn.ModuleList([
-            TransformerBlock(n_emb, n_head, hidden_dim, p_drop_attn, causal_obs=False)
+            TransformerBlock(n_emb, n_head, hidden_dim, p_drop_attn, causal_obs=False, action_attn_type=action_attn_type)
             for _ in range(n_layer)
         ])
         

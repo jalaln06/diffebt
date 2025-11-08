@@ -58,6 +58,7 @@ class EBTTransformerHybridImagePolicy(BaseImagePolicy):
         obs_as_cond: bool = True,
         n_cond_layers: int = 2,
         energy_head_hidden_dim: int = None,
+        action_attn_type: str = 'bidirectional',
         # Vision encoder (RoboMimic style)
         crop_shape: Optional[Tuple[int, int]] = (76, 76),
         obs_encoder_group_norm: bool = False,
@@ -173,6 +174,7 @@ class EBTTransformerHybridImagePolicy(BaseImagePolicy):
             obs_as_cond=obs_as_cond,      # ✓ Now supported (must be True)
             n_cond_layers=n_cond_layers,  # ✓ Accepted but not used (kept for compatibility)
             energy_head_hidden_dim=energy_head_hidden_dim,  # ✓ Now supported
+            action_attn_type=action_attn_type  # ✓ Now supported
         )
         
         # MCMC parameters (learnable)

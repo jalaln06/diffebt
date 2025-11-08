@@ -9,9 +9,9 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "default"
 
-horizon: 32
-n_obs_steps: 8
-n_action_steps: 16
+horizon: 10
+n_obs_steps: 2
+n_action_steps: 8
 n_latency_steps: 0
 past_action_visible: True
 keypoint_visible_rate: 1.0
@@ -26,9 +26,9 @@ policy:
   n_obs_steps: ${n_obs_steps}
   
   # MCMC parameters
-  num_inference_steps: 10
-  mcmc_step_size: 0.02
-  mcmc_step_size_learnable: true
+  num_inference_steps: 15
+  mcmc_step_size: 0.15
+  mcmc_step_size_learnable: false
   langevin_noise_std: 0.001
   langevin_noise_learnable: false
   
@@ -54,6 +54,7 @@ policy:
   obs_as_cond: true
   n_cond_layers: 2
   energy_head_hidden_dim: null
+  action_attn_type: 'bidirectional'
   
   # Vision encoder
   obs_encoder_group_norm: true
