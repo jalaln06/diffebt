@@ -1,3 +1,4 @@
+from sys import prefix
 import wandb
 import numpy as np
 import torch
@@ -155,6 +156,7 @@ class PushTImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        all_steps_to_success = [None] * n_inits  # Initiate memory for number of steps to success
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -177,6 +179,11 @@ class PushTImageRunner(BaseImageRunner):
             obs = env.reset()
             past_action = None
             policy.reset()
+
+            # trackers for number of steps to success
+            steps_to_success = np.full(this_n_active_envs, self.max_steps, dtype=np.int32)
+            env_is_successful = np.zeros(this_n_active_envs, dtype=bool)
+            step_counter = 0
 
             pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtImageRunner {chunk_idx+1}/{n_chunks}", 
                 leave=False, mininterval=self.tqdm_interval_sec)
@@ -206,6 +213,29 @@ class PushTImageRunner(BaseImageRunner):
 
                 # step env
                 obs, reward, done, info = env.step(action)
+
+                # check for success
+                # reward shape is (n_envs, n_action_steps)
+                # we only care about the envs active in this chunk
+                chunk_rewards = reward[this_local_slice] 
+
+                # new_successes shape is (this_n_active_envs, n_action_steps)
+                new_successes = (chunk_rewards >= 1.0)
+
+                # find the first step index where success occurred *within this chunk*
+                any_success_in_chunk = new_successes
+                first_success_in_chunk_idx = np.zeros_like(new_successes, dtype=int)
+
+                for i in range(this_n_active_envs):
+                    # if this env hasn't been marked successful yet AND it succeeded in this chunk
+                    if not env_is_successful[i] and any_success_in_chunk[i]:
+                        # record the global step number (plus 1 for 1-based indexing)
+                        steps_to_success[i] = step_counter + first_success_in_chunk_idx[i] + 1
+                        env_is_successful[i] = True
+
+                # Increment global step counter by the number of steps in this chunk
+                step_counter += action.shape[1]
+
                 done = np.all(done)
                 past_action = action
 
@@ -215,11 +245,13 @@ class PushTImageRunner(BaseImageRunner):
 
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+            all_steps_to_success[this_global_slice] = steps_to_success[this_local_slice] # store steps to success for this chunk
         # clear out video buffer
         _ = env.reset()
 
         # log
         max_rewards = collections.defaultdict(list)
+        steps_to_success_agg = collections.defaultdict(list)
         log_data = dict()
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
@@ -236,6 +268,11 @@ class PushTImageRunner(BaseImageRunner):
             max_rewards[prefix].append(max_reward)
             log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
 
+            # Add new metric
+            steps_val = all_steps_to_success[i]
+            steps_to_success_agg[prefix].append(steps_val)
+            log_data[prefix+f'steps_to_success_{torch.seed}'] = int(steps_val) # Cast to int for JSON
+
             # visualize sim
             video_path = all_video_paths[i]
             if video_path is not None:
@@ -246,6 +283,16 @@ class PushTImageRunner(BaseImageRunner):
         for prefix, value in max_rewards.items():
             name = prefix+'mean_score'
             value = np.mean(value)
+            log_data[name] = value
+
+        for prefix, value in steps_to_success_agg.items():
+            name = prefix+'mean_steps_to_success'
+            # Filter out runs that never succeeded (value == max_steps)
+            successful_runs = [x for x in value if x < self.max_steps]
+            if len(successful_runs) > 0:
+                value = np.mean(successful_runs)
+            else:
+                value = np.nan # Or self.max_steps, depending on how you want to log it
             log_data[name] = value
 
         return log_data
