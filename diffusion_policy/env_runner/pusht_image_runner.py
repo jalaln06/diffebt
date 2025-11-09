@@ -157,6 +157,7 @@ class PushTImageRunner(BaseImageRunner):
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
         all_steps_to_success = [None] * n_inits  # Initiate memory for number of steps to success
+        all_smoothness_jerk = [None] * n_inits
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -179,6 +180,9 @@ class PushTImageRunner(BaseImageRunner):
             obs = env.reset()
             past_action = None
             policy.reset()
+
+            # Tracker for smoothness
+            episode_agent_pos = [[] for _ in range(this_n_active_envs)]
 
             # trackers for number of steps to success
             steps_to_success = np.full(this_n_active_envs, self.max_steps, dtype=np.int32)
@@ -214,6 +218,30 @@ class PushTImageRunner(BaseImageRunner):
                 # step env
                 obs, reward, done, info = env.step(action)
 
+                # Store agent position for smoothness calculation
+                # info['pos_agent'] shape is (n_envs, n_action_steps, 2)
+                active_info_chunk = info[this_local_slice]
+
+                for i in range(this_n_active_envs):
+                    # env_info can be a list[dict] (normal) or a dict (if episode terminated)
+                    env_info = active_info_chunk[i]
+                    
+                    pos_chunk_list = []
+                    if isinstance(env_info, list):
+                        # Normal case: iterate through list of info_dicts
+                        for step_info in env_info:
+                            if 'pos_agent' in step_info:
+                                pos_chunk_list.append(step_info['pos_agent'])
+                    elif isinstance(env_info, dict):
+                        # Termination case: env_info is a single info_dict
+                        if 'pos_agent' in env_info:
+                            pos_chunk_list.append(env_info['pos_agent'])
+                    
+                    if len(pos_chunk_list) > 0:
+                        # Stack all positions gathered from this chunk
+                        pos_chunk_for_env_i = np.stack(pos_chunk_list)
+                        episode_agent_pos[i].append(pos_chunk_for_env_i)
+
                 # check for success
                 # reward shape is (n_envs, n_action_steps)
                 # we only care about the envs active in this chunk
@@ -246,12 +274,27 @@ class PushTImageRunner(BaseImageRunner):
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
             all_steps_to_success[this_global_slice] = steps_to_success[this_local_slice] # store steps to success for this chunk
+
+            full_episode_pos = [np.concatenate(pos_list, axis=0) for pos_list in episode_agent_pos]
+            episode_smoothness_jerk = [0.0] * this_n_active_envs
+
+            for i in range(this_n_active_envs):
+                pos = full_episode_pos[i] # Shape (T, 2)
+                if pos.shape[0] > 3: # Need at least 4 points to calculate 3rd derivative
+                    # Calculate jerk (3rd derivative of position)
+                    jerk = np.diff(pos, n=3, axis=0) # Shape (T-3, 2)
+                    # Calculate mean squared jerk
+                    mean_squared_jerk = np.mean(np.sum(jerk**2, axis=1))
+                    episode_smoothness_jerk[i] = mean_squared_jerk
+
+            all_smoothness_jerk[this_global_slice] = episode_smoothness_jerk
         # clear out video buffer
         _ = env.reset()
 
         # log
         max_rewards = collections.defaultdict(list)
         steps_to_success_agg = collections.defaultdict(list)
+        smoothness_jerk_agg = collections.defaultdict(list)
         log_data = dict()
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
@@ -268,10 +311,15 @@ class PushTImageRunner(BaseImageRunner):
             max_rewards[prefix].append(max_reward)
             log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
 
-            # Add new metric
+            # Steps to success metric
             steps_val = all_steps_to_success[i]
             steps_to_success_agg[prefix].append(steps_val)
             log_data[prefix+f'steps_to_success_{torch.seed}'] = int(steps_val) # Cast to int for JSON
+
+            # Jerk metric
+            smoothness_val = all_smoothness_jerk[i]
+            smoothness_jerk_agg[prefix].append(smoothness_val)
+            log_data[prefix+f'smoothness_jerk_{seed}'] = smoothness_val
 
             # visualize sim
             video_path = all_video_paths[i]
@@ -293,6 +341,11 @@ class PushTImageRunner(BaseImageRunner):
                 value = np.mean(successful_runs)
             else:
                 value = np.nan # Or self.max_steps, depending on how you want to log it
+            log_data[name] = value
+
+        for prefix, value in smoothness_jerk_agg.items():
+            name = prefix+'mean_smoothness_jerk'
+            value = np.mean(value)
             log_data[name] = value
 
         return log_data
